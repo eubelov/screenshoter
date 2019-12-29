@@ -1,0 +1,5 @@
+server:
+    host: "http://tngdockervm.westus.cloudapp.azure.com"
+    port: 5601
+    pingPath: "api/ping"
+    actionPath: "api/screenshots"
