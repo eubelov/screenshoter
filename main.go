@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"time"
 
 	"golang.org/x/sync/semaphore"
 
@@ -60,8 +61,11 @@ var (
 )
 
 func main() {
-	conf := readConfig()
-	log.Printf("%+v", *conf)
+	logger, logFile := setupLogToFile()
+	defer logFile.Close()
+
+	conf := readConfig(logger)
+	logger.Printf("%+v", *conf)
 
 	flag.Parse()
 
@@ -80,30 +84,38 @@ func main() {
 		},
 	}
 
-	fmt.Printf("%+v\n", opt)
-	checkServerAvailable(opt.server)
-	takeScreenshots(opt)
+	logger.Printf("%+v\n", opt)
+	checkServerAvailable(opt.server, logger)
+	takeScreenshots(opt, logger)
 }
 
-func readConfig() *config {
+func setupLogToFile() (l *log.Logger, f *os.File) {
+	_ = os.Mkdir("logs", 0644)
+
+	file, _ := os.OpenFile(fmt.Sprintf("logs/%s.log", uuid.New()), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	logger := log.New(io.MultiWriter(os.Stdout, file), "", log.LstdFlags)
+	return logger, file
+}
+
+func readConfig(logger *log.Logger) *config {
 	f, err := os.Open("config.yaml")
 	if err != nil {
-		log.Panicf("config.yaml not found in binary directory: %v", err)
+		logger.Panicf("config.yaml not found in binary directory: %v", err)
 	}
 
 	defer f.Close()
 	var conf config
 	dec := yaml.NewDecoder(f)
 	if err = dec.Decode(&conf); err != nil {
-		log.Panicf("can't parse config.yaml: %v", err)
+		logger.Panicf("can't parse config.yaml: %v", err)
 	}
 
 	return &conf
 }
 
-func takeScreenshots(runOptions *runOptions) {
+func takeScreenshots(runOptions *runOptions, logger *log.Logger) {
 	if file, err := os.Open(runOptions.inputFilePath); err != nil {
-		log.Panicf("file does not exist: %s", runOptions.inputFilePath)
+		logger.Panicf("file does not exist: %s", runOptions.inputFilePath)
 	} else {
 		defer file.Close()
 
@@ -112,27 +124,27 @@ func takeScreenshots(runOptions *runOptions) {
 
 		for scanner.Scan() {
 			if err := runOptions.sem.Acquire(ctx, 1); err != nil {
-				log.Printf("failed to acquire semaphore: %v", err)
+				logger.Printf("failed to acquire semaphore: %v", err)
 			}
 
 			url := scanner.Text()
 
-			go func() {
-				saveImage(runOptions, actionURL, url)
-				runOptions.sem.Release(1)
-			}()
+			go saveImage(runOptions, actionURL, url, logger)
 		}
 
 		if err := runOptions.sem.Acquire(ctx, int64(*concurrency)); err != nil {
-			log.Printf("failed to acquire semaphore: %v", err)
+			logger.Printf("failed to acquire semaphore: %v", err)
 		}
 	}
 }
 
-func saveImage(runOptions *runOptions, host, u string) {
-	log.Printf("processing %s", u)
+func saveImage(runOptions *runOptions, host, u string, logger *log.Logger) {
+	start := time.Now()
+
+	logger.Printf("processing %s", u)
 
 	var fileName string
+	defer runOptions.sem.Release(1)
 
 	if runOptions.useQueryParam != "" {
 		parsedURL, _ := url.Parse(u)
@@ -156,36 +168,38 @@ func saveImage(runOptions *runOptions, host, u string) {
 	client := &http.Client{}
 	req, err := http.NewRequest("GET", fmt.Sprintf("%s?%s", host, formData), nil)
 	if err != nil {
-		log.Panic(err)
+		logger.Panic(err)
 		return
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Panic(err)
+		logger.Panic(err)
 	}
 
 	defer resp.Body.Close()
 
-	log.Printf("response status:%s", resp.Status)
 	if resp.StatusCode > 299 {
 		return
 	}
 
-	if f, err := os.Create(path.Join(runOptions.outputDirectory, fileName)); err != nil {
+	f, err := os.Create(path.Join(runOptions.outputDirectory, fileName))
+	if err != nil {
 		os.Remove(f.Name())
-		log.Panic(err)
-	} else {
-		defer f.Close()
-		io.Copy(f, resp.Body)
+		logger.Panic(err)
 	}
+
+	defer f.Close()
+	io.Copy(f, resp.Body)
+
+	logger.Printf("saved file %s. completed in %s of which %d seconds is a delay", fileName, time.Since(start), runOptions.delay)
 }
 
-func checkServerAvailable(conf *config) {
+func checkServerAvailable(conf *config, logger *log.Logger) {
 	pingPath := fmt.Sprintf("%s:%d/%s", conf.Server.Host, conf.Server.Port, conf.Server.PingPath)
 	if _, err := http.Head(pingPath); err != nil {
-		log.Panicf("server %s is not available: %v", conf.Server.Host, err)
+		logger.Panicf("server %s is not available: %v", conf.Server.Host, err)
 	}
 
-	log.Printf("screenshot taker server %s is available", conf.Server.Host)
+	logger.Printf("screenshot taker server %s is available", conf.Server.Host)
 }
